@@ -1274,6 +1274,14 @@ def main():
         # Create application with proper timeout configuration
         from telegram.ext import ApplicationBuilder
         
+        # Start health check server (for Render keep-alive)
+        try:
+            from health_check import start_health_check
+            start_health_check()
+            print("🏥 Health check server started (port 8080)")
+        except Exception as e:
+            print(f"⚠️ Health check server not started: {e}")
+        
         print("🤖 Bot is starting...")
         
         # Create application with simplified configuration
