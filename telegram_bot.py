@@ -1414,8 +1414,9 @@ def main():
         # Start health check server (for Render keep-alive)
         try:
             from health_check import start_health_check
+            port = os.getenv('PORT', '8080')
             start_health_check()
-            print("🏥 Health check server started (port 8080)")
+            print(f"🏥 Health check server started (port {port})")
         except Exception as e:
             print(f"⚠️ Health check server not started: {e}")
         
