@@ -7,6 +7,7 @@ import logging
 import base64
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.error import Conflict
 from dl_booking_automation import DLBookingAutomation
 import asyncio
 from datetime import datetime
@@ -1393,13 +1394,20 @@ async def schedule_checker():
             await asyncio.sleep(60        )
 
 
+# Global variable to store schedule checker task
+schedule_checker_task = None
+
 async def schedule_checker():
     """Background task to check and apply scheduled pause/resume"""
+    global schedule_checker_task
     while True:
         try:
             check_scheduled_pause()
             # Check every minute
             await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            logger.info("Schedule checker task cancelled (shutting down)")
+            break
         except Exception as e:
             logger.error(f"Error in schedule checker: {e}")
             await asyncio.sleep(60)
@@ -1453,12 +1461,40 @@ def main():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
         # Start schedule checker after event loop is running
+        global schedule_checker_task
         async def post_init(application):
             """Start background tasks after bot is initialized"""
-            asyncio.create_task(schedule_checker())
+            global schedule_checker_task
+            schedule_checker_task = asyncio.create_task(schedule_checker())
             print("📅 Schedule checker started (checks every minute)")
         
+        # Add error handler for Conflict errors (expected during restarts)
+        async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+            """Handle errors, especially Conflict errors during restarts"""
+            error = context.error
+            if isinstance(error, Conflict):
+                # Conflict errors are normal during bot restarts/deployments
+                logger.warning("Conflict error (expected during restart): Another instance may be starting")
+                return
+            # Log other errors
+            logger.error(f"Exception while handling an update: {error}", exc_info=error)
+        
+        application.add_error_handler(error_handler)
         application.post_init = post_init
+        
+        # Handle shutdown gracefully
+        async def post_shutdown(application):
+            """Clean up background tasks on shutdown"""
+            global schedule_checker_task
+            if schedule_checker_task and not schedule_checker_task.done():
+                schedule_checker_task.cancel()
+                try:
+                    await schedule_checker_task
+                except asyncio.CancelledError:
+                    pass
+            logger.info("Background tasks cleaned up")
+        
+        application.post_shutdown = post_shutdown
         
         # Start bot
         print("✅ Bot is running! Press Ctrl+C to stop.")
