@@ -1419,21 +1419,16 @@ def main():
         # Create application with proper timeout configuration
         from telegram.ext import ApplicationBuilder
         
-        # Health check server disabled for Worker services
-        # Render Worker services don't need HTTP endpoints
-        # UptimeRobot can ping the main service URL to keep it awake
-        # If you need health check, set ENABLE_HEALTH_CHECK=true in Render environment variables
-        enable_health_check = os.getenv('ENABLE_HEALTH_CHECK', 'false').lower() == 'true'
-        if enable_health_check:
-            try:
-                from health_check import start_health_check
-                port = os.getenv('PORT', '8080')
-                start_health_check()
-                print(f"🏥 Health check server started (port {port})")
-            except Exception as e:
-                print(f"⚠️ Health check server not started: {e}")
-        else:
-            print("ℹ️ Health check server disabled (not needed for Worker services)")
+        # Start health check server for UptimeRobot keep-alive
+        # This creates an HTTP endpoint that UptimeRobot can ping
+        try:
+            from health_check import start_health_check
+            start_health_check()
+            # Render will auto-detect the port and configure routing
+            print("🏥 Health check server started (for UptimeRobot keep-alive)")
+        except Exception as e:
+            print(f"⚠️ Health check server not started: {e}")
+            print("ℹ️ Bot will still work, but may sleep without UptimeRobot pings")
         
         print("🤖 Bot is starting...")
         
