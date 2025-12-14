@@ -1451,9 +1451,13 @@ def main():
         application.add_handler(CommandHandler("status", status))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        # Start schedule checker in background
-        asyncio.create_task(schedule_checker())
-        print("📅 Schedule checker started (checks every minute)")
+        # Start schedule checker after event loop is running
+        async def post_init(application):
+            """Start background tasks after bot is initialized"""
+            asyncio.create_task(schedule_checker())
+            print("📅 Schedule checker started (checks every minute)")
+        
+        application.post_init = post_init
         
         # Start bot
         print("✅ Bot is running! Press Ctrl+C to stop.")
