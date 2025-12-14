@@ -1,0 +1,13 @@
+start - Show help message
+myid - Get your Telegram user ID
+setup - Set application number and DOB
+check - Check slot availability once
+monitor - Start continuous monitoring
+stop - Stop monitoring
+pause - Pause all bot operations
+resume - Resume bot operations
+interval - Set check interval
+captcha_method - Set captcha solving method
+set_gemini_key - Set Gemini API key for AI solving
+status - Check current status
+

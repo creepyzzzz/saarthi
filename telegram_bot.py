@@ -9,6 +9,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from dl_booking_automation import DLBookingAutomation
 import asyncio
+from datetime import datetime
+import pytz
 
 # Try to load environment variables from .env file
 try:
@@ -49,6 +51,15 @@ else:
 
 # Store automation instances per user
 user_automations = {}
+
+# Global bot pause state
+BOT_PAUSED = False
+MANUAL_PAUSE_OVERRIDE = False  # True if user manually paused/resumed (overrides schedule)
+
+# Scheduled pause/resume times (IST - GMT+5:30)
+PAUSE_HOUR = 21  # 9 PM IST
+RESUME_HOUR = 7  # 7 AM IST
+IST = pytz.timezone('Asia/Kolkata')  # Indian Standard Time
 
 # Default check interval (in seconds) - 30 minutes
 DEFAULT_CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
@@ -125,10 +136,12 @@ Welcome! I can help you automate DL test slot booking.
 /setup - Set application number and DOB \(optional, defaults are set\)
 /check - Check slot availability once
 /monitor - Start continuous monitoring
-/interval - Set check interval \(default: 5 minutes\)
+/stop - Stop monitoring
+/pause - Pause all bot operations
+/resume - Resume bot operations
+/interval - Set check interval \(default: 30 minutes\)
 /captcha_method - Set captcha solving method
 /set_gemini_key - Set Gemini API key for AI solving
-/stop - Stop monitoring
 /status - Check current status
 
 *Security Setup:*
@@ -601,6 +614,16 @@ async def check_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check slot availability once"""
     if not await check_authorization(update, context):
         return
+    
+    if BOT_PAUSED:
+        await update.message.reply_text(
+            "⏸️ *Bot is Paused*\n\n"
+            "Bot operations are currently paused.\n"
+            "Use /resume to activate the bot.",
+            parse_mode='Markdown'
+        )
+        return
+    
     user_id = update.effective_user.id
     ensure_user_setup(user_id)  # Auto-setup with defaults
     
@@ -719,6 +742,16 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start continuous monitoring"""
     if not await check_authorization(update, context):
         return
+    
+    if BOT_PAUSED:
+        await update.message.reply_text(
+            "⏸️ *Bot is Paused*\n\n"
+            "Bot operations are currently paused.\n"
+            "Use /resume to activate the bot.",
+            parse_mode='Markdown'
+        )
+        return
+    
     user_id = update.effective_user.id
     ensure_user_setup(user_id)  # Auto-setup with defaults
     
@@ -941,6 +974,74 @@ async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Monitoring stopped")
 
 
+def check_scheduled_pause():
+    """Check if bot should be paused based on schedule (IST time)"""
+    global BOT_PAUSED, MANUAL_PAUSE_OVERRIDE
+    
+    # If user manually paused/resumed, don't auto-schedule
+    if MANUAL_PAUSE_OVERRIDE:
+        return
+    
+    # Get current IST time
+    ist_now = datetime.now(IST)
+    current_hour = ist_now.hour
+    
+    # Pause between 9 PM (21:00) and 7 AM (07:00)
+    if current_hour >= PAUSE_HOUR or current_hour < RESUME_HOUR:
+        if not BOT_PAUSED:
+            BOT_PAUSED = True
+            logger.info(f"🤖 Bot auto-paused at {ist_now.strftime('%H:%M:%S IST')} (scheduled pause)")
+    else:
+        if BOT_PAUSED:
+            BOT_PAUSED = False
+            logger.info(f"🤖 Bot auto-resumed at {ist_now.strftime('%H:%M:%S IST')} (scheduled resume)")
+
+
+async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pause bot operations (manual override)"""
+    global BOT_PAUSED, MANUAL_PAUSE_OVERRIDE
+    if not await check_authorization(update, context):
+        return
+    
+    BOT_PAUSED = True
+    MANUAL_PAUSE_OVERRIDE = True  # Override automatic schedule
+    
+    # Stop all active monitoring
+    user_id = update.effective_user.id
+    if user_id in user_automations:
+        user_automations[user_id]['monitoring'] = False
+    
+    ist_now = datetime.now(IST)
+    await update.message.reply_text(
+        f"⏸️ *Bot Paused (Manual)*\n\n"
+        f"All bot operations are paused.\n"
+        f"Current time: {ist_now.strftime('%H:%M:%S IST')}\n\n"
+        f"Use /resume to start again.\n"
+        f"Note: Manual pause overrides scheduled pause/resume.",
+        parse_mode='Markdown'
+    )
+
+
+async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resume bot operations (manual override)"""
+    global BOT_PAUSED, MANUAL_PAUSE_OVERRIDE
+    if not await check_authorization(update, context):
+        return
+    
+    BOT_PAUSED = False
+    MANUAL_PAUSE_OVERRIDE = True  # Override automatic schedule
+    
+    ist_now = datetime.now(IST)
+    await update.message.reply_text(
+        f"▶️ *Bot Resumed (Manual)*\n\n"
+        f"Bot operations are active again!\n"
+        f"Current time: {ist_now.strftime('%H:%M:%S IST')}\n\n"
+        f"You can now use /check or /monitor.\n"
+        f"Note: Manual resume overrides scheduled pause/resume.",
+        parse_mode='Markdown'
+    )
+
+
 async def set_captcha_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set captcha solving method"""
     if not await check_authorization(update, context):
@@ -1029,13 +1130,25 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     info = user_automations[user_id]
     monitoring_status = "🟢 Running" if info.get('monitoring', False) else "🔴 Stopped"
+    bot_status = "⏸️ Paused" if BOT_PAUSED else "▶️ Active"
+    pause_mode = "Manual Override" if MANUAL_PAUSE_OVERRIDE else "Auto Schedule"
     interval_minutes = info.get('check_interval', DEFAULT_CHECK_INTERVAL) // 60
     captcha_method = info.get('captcha_method', DEFAULT_CAPTCHA_METHOD)
     gemini_key = info.get('gemini_api_key')
     gemini_status = "✅ Set" if gemini_key else "❌ Not set"
     
+    ist_now = datetime.now(IST)
+    next_pause = f"{PAUSE_HOUR}:00 IST" if ist_now.hour < PAUSE_HOUR else f"Tomorrow {PAUSE_HOUR}:00 IST"
+    next_resume = f"{RESUME_HOUR}:00 IST" if ist_now.hour >= PAUSE_HOUR or ist_now.hour < RESUME_HOUR else f"Today {RESUME_HOUR}:00 IST"
+    
     status_text = f"""
 *Current Status:*
+
+Bot Status: {bot_status} ({pause_mode})
+Current Time: {ist_now.strftime('%H:%M:%S IST')}
+Schedule: Pause at {PAUSE_HOUR}:00 IST | Resume at {RESUME_HOUR}:00 IST
+Next Pause: {next_pause}
+Next Resume: {next_resume}
 
 Application Number: `{info['app_no']}`
 Date of Birth: `{info['dob']}`
@@ -1268,6 +1381,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def schedule_checker():
+    """Background task to check and apply scheduled pause/resume"""
+    while True:
+        try:
+            check_scheduled_pause()
+            # Check every minute
+            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"Error in schedule checker: {e}")
+            await asyncio.sleep(60        )
+
+
+async def schedule_checker():
+    """Background task to check and apply scheduled pause/resume"""
+    while True:
+        try:
+            check_scheduled_pause()
+            # Check every minute
+            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"Error in schedule checker: {e}")
+            await asyncio.sleep(60)
+
+
 def main():
     """Start the bot"""
     try:
@@ -1284,6 +1421,13 @@ def main():
         
         print("🤖 Bot is starting...")
         
+        # Check initial schedule state
+        check_scheduled_pause()
+        ist_now = datetime.now(IST)
+        pause_status = "⏸️ Paused" if BOT_PAUSED else "▶️ Active"
+        print(f"📅 Schedule: Auto-pause at {PAUSE_HOUR}:00 IST, Auto-resume at {RESUME_HOUR}:00 IST")
+        print(f"🕐 Current time: {ist_now.strftime('%H:%M:%S IST')} - Bot status: {pause_status}")
+        
         # Create application with simplified configuration
         application = (
             ApplicationBuilder()
@@ -1298,12 +1442,18 @@ def main():
         application.add_handler(CommandHandler("setup", setup))
         application.add_handler(CommandHandler("check", check_slots))
         application.add_handler(CommandHandler("monitor", start_monitoring))
+        application.add_handler(CommandHandler("stop", stop_monitoring))
+        application.add_handler(CommandHandler("pause", pause_bot))
+        application.add_handler(CommandHandler("resume", resume_bot))
         application.add_handler(CommandHandler("interval", set_interval))
         application.add_handler(CommandHandler("captcha_method", set_captcha_method))
         application.add_handler(CommandHandler("set_gemini_key", set_gemini_key))
-        application.add_handler(CommandHandler("stop", stop_monitoring))
         application.add_handler(CommandHandler("status", status))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        # Start schedule checker in background
+        asyncio.create_task(schedule_checker())
+        print("📅 Schedule checker started (checks every minute)")
         
         # Start bot
         print("✅ Bot is running! Press Ctrl+C to stop.")
