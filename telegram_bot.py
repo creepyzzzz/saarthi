@@ -12,6 +12,8 @@ from dl_booking_automation import DLBookingAutomation
 import asyncio
 from datetime import datetime
 import pytz
+import time
+import glob
 
 # Try to load environment variables from .env file
 try:
@@ -27,28 +29,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Try to import google.generativeai for Gemini
+# Try to import google.genai for Gemini (new package)
 try:
-    import google.generativeai as genai
+    from google import genai
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-    logger.warning("google-generativeai not installed. AI captcha solving will not work.")
+    logger.warning("google-genai not installed. AI captcha solving will not work.")
 
-# Bot token - Load from environment variable or use hardcoded fallback
-# For security: Use environment variable BOT_TOKEN or create .env file
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8384272855:AAFJzQG-xv7uzN6R-0DyIeUghr6qJV_y7d0")
+# Cache for Gemini client to avoid repeated initialization
+_gemini_client_cache = {}
 
-# Authorized user IDs (add your Telegram user ID here)
+# Cleanup function for old captcha files
+def cleanup_captcha_files():
+    """Clean up any leftover captcha files"""
+    try:
+        captcha_files = glob.glob("captcha_image*.jpg") + glob.glob("captcha_image*.png")
+        for file in captcha_files:
+            try:
+                if os.path.exists(file):
+                    # Check if file is older than 5 minutes
+                    file_age = time.time() - os.path.getmtime(file)
+                    if file_age > 300:  # 5 minutes
+                        os.remove(file)
+                        logger.debug(f"Cleaned up old captcha file: {file}")
+            except Exception as e:
+                logger.debug(f"Could not remove captcha file {file}: {e}")
+    except Exception as e:
+        logger.debug(f"Error in cleanup_captcha_files: {e}")
+
+# Run cleanup on import
+cleanup_captcha_files()
+
+# Bot token - Load from environment variable (required)
+# For security: Use environment variable BOT_TOKEN in .env file
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required. Please set it in your .env file.")
+
+# Authorized user IDs - Load from environment variable (required)
 # To find your user ID, start a chat with @userinfobot on Telegram
-# Can also be set via AUTHORIZED_USERS environment variable (comma-separated)
-AUTHORIZED_USERS_STR = os.getenv("AUTHORIZED_USERS", "")
-if AUTHORIZED_USERS_STR:
-    AUTHORIZED_USERS = [int(uid.strip()) for uid in AUTHORIZED_USERS_STR.split(",")]
-else:
-    AUTHORIZED_USERS = [
-        2047931706  # Your Telegram user ID
-    ]
+# Set via AUTHORIZED_USERS environment variable (comma-separated)
+AUTHORIZED_USERS_STR = os.getenv("AUTHORIZED_USERS")
+if not AUTHORIZED_USERS_STR:
+    raise ValueError("AUTHORIZED_USERS environment variable is required. Please set it in your .env file.")
+AUTHORIZED_USERS = [int(uid.strip()) for uid in AUTHORIZED_USERS_STR.split(",")]
 
 # Store automation instances per user
 user_automations = {}
@@ -62,27 +87,33 @@ PAUSE_HOUR = 21  # 9 PM IST
 RESUME_HOUR = 7  # 7 AM IST
 IST = pytz.timezone('Asia/Kolkata')  # Indian Standard Time
 
-# Default check interval (in seconds) - 30 minutes
-DEFAULT_CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
+# Check interval (in seconds) - Load from environment variable (required)
+CHECK_INTERVAL_STR = os.getenv("CHECK_INTERVAL", "1800")
+DEFAULT_CHECK_INTERVAL = int(CHECK_INTERVAL_STR)
 
-# Default credentials (you can change these)
-# Load from environment variables for security
-DEFAULT_APPLICATION_NUMBER = os.getenv("APPLICATION_NUMBER", "3209941425")
-DEFAULT_DOB = os.getenv("DOB", "04-03-1974")
+# Application credentials - Load from environment variables (required)
+DEFAULT_APPLICATION_NUMBER = os.getenv("APPLICATION_NUMBER")
+if not DEFAULT_APPLICATION_NUMBER:
+    raise ValueError("APPLICATION_NUMBER environment variable is required. Please set it in your .env file.")
 
-# Default captcha solving method: 'manual' or 'ai'
+DEFAULT_DOB = os.getenv("DOB")
+if not DEFAULT_DOB:
+    raise ValueError("DOB environment variable is required. Please set it in your .env file.")
+
+# Captcha solving method: 'manual' or 'ai' - Load from environment variable
 DEFAULT_CAPTCHA_METHOD = os.getenv("CAPTCHA_METHOD", "ai")
 
-# Default Gemini API key (can be overridden by user)
-# Load from environment variable for security
-DEFAULT_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBESa0zMX14svhczIh197fd_-3-PnIAROI")
+# Gemini API key - Load from environment variable (required)
+DEFAULT_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not DEFAULT_GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable is required. Please set it in your .env file.")
 
 
 def is_authorized(user_id: int) -> bool:
     """Check if user is authorized to use the bot"""
     if not AUTHORIZED_USERS:
-        # If list is empty, allow all users (for initial setup)
-        return True
+        logger.error("AUTHORIZED_USERS is empty. Please set it in your .env file.")
+        return False
     return user_id in AUTHORIZED_USERS
 
 
@@ -115,7 +146,8 @@ def ensure_user_setup(user_id):
             'captcha_method': DEFAULT_CAPTCHA_METHOD,
             'gemini_api_key': DEFAULT_GEMINI_API_KEY,
             'waiting_for_setup_app_no': False,
-            'waiting_for_setup_dob': False
+            'waiting_for_setup_dob': False,
+            'monitoring_task': None
         }
 
 
@@ -209,7 +241,8 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'captcha_method': DEFAULT_CAPTCHA_METHOD,
             'gemini_api_key': DEFAULT_GEMINI_API_KEY,
             'waiting_for_setup_app_no': False,
-            'waiting_for_setup_dob': False
+            'waiting_for_setup_dob': False,
+            'monitoring_task': None
         }
         
         await update.message.reply_text(
@@ -233,7 +266,8 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def solve_captcha_with_gemini(captcha_file, api_key):
     """
-    Solve CAPTCHA using Gemini AI
+    Solve CAPTCHA using Gemini AI (optimized with client caching)
+    Uses the new google.genai package
     
     Args:
         captcha_file: Path to CAPTCHA image file
@@ -246,68 +280,20 @@ async def solve_captcha_with_gemini(captcha_file, api_key):
         return None
     
     try:
-        # Configure Gemini
-        genai.configure(api_key=api_key)
+        # Get or create Gemini client (cached per API key)
+        cache_key = f"client_{api_key}"
+        if cache_key not in _gemini_client_cache:
+            client = genai.Client(api_key=api_key)
+            _gemini_client_cache[cache_key] = client
+            logger.debug("Created new Gemini client (cached)")
+        else:
+            client = _gemini_client_cache[cache_key]
+            logger.debug("Using cached Gemini client")
         
-        # Read image
-        with open(captcha_file, 'rb') as f:
-            image_data = f.read()
-        
-        # Get available models from Google's API
-        # According to official docs: https://ai.google.dev/gemini-api/docs/models
-        models = genai.list_models()
-        model = None
-        
-        # Priority order based on official Google documentation (Dec 2024):
-        # 1. gemini-2.5-flash-lite (fastest, most cost-efficient, free tier)
-        # 2. gemini-2.5-flash (balanced, free tier)
-        # 3. gemini-1.5-flash (older but still available)
-        # 4. gemini-1.5-pro (older but still available)
-        # 5. gemini-pro (legacy)
-        preferred_model_names = [
-            'gemini-2.5-flash-lite',
-            'gemini-2.5-flash',
-            'gemini-1.5-flash',
-            'gemini-1.5-pro',
-            'gemini-pro-vision',
-            'gemini-pro'
-        ]
-        
-        # First, try to find models by exact name match from list_models()
-        available_model_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        logger.debug(f"Available models: {available_model_names}")
-        
-        # Try preferred models in order
-        for preferred_name in preferred_model_names:
-            # Check if any available model matches (could be full name like 'models/gemini-2.5-flash')
-            for model_name in available_model_names:
-                if preferred_name in model_name.lower():
-                    try:
-                        model = genai.GenerativeModel(model_name)
-                        logger.info(f"Using model: {model_name}")
-                        break
-                    except Exception as e:
-                        logger.debug(f"Failed to create model {model_name}: {e}")
-                        continue
-            if model:
-                break
-        
-        # If no preferred model found, use first available model that supports generateContent
-        if model is None:
-            for m in models:
-                if 'generateContent' in m.supported_generation_methods:
-                    # Skip models that are likely not free tier (3-pro, 2.5-pro without flash)
-                    if '3-pro' not in m.name.lower() and ('flash' in m.name.lower() or '1.5' in m.name.lower() or 'pro' in m.name.lower()):
-                        try:
-                            model = genai.GenerativeModel(m.name)
-                            logger.info(f"Using fallback model: {m.name}")
-                            break
-                        except Exception as e:
-                            logger.debug(f"Failed to create fallback model {m.name}: {e}")
-                            continue
-        
-        if model is None:
-            raise Exception("No suitable Gemini model found. Please check your API key and available models.")
+        # Use gemini-2.5-flash as per official documentation
+        # This is the recommended model from the quickstart guide
+        model_name = 'gemini-2.5-flash'
+        logger.info(f"Using model: {model_name}")
         
         # Create prompt - emphasize accuracy, order, and case sensitivity
         prompt = """You are an OCR system. Look at this CAPTCHA image carefully.
@@ -323,19 +309,69 @@ The CAPTCHA may have noise, distortion, or background patterns, but extract the 
 
 Example: If you see "AbC123" from left to right, return exactly "AbC123" - not "ABC123" or "123AbC"."""
         
-        # Generate content with image using PIL Image
-        import PIL.Image
-        image = PIL.Image.open(captcha_file)
-        response = model.generate_content([prompt, image])
+        # Read image file using PIL (lazy import to save memory)
+        from PIL import Image
+        image = None
+        try:
+            image = Image.open(captcha_file)
+            
+            # Generate content using new google.genai API
+            # According to official docs: https://ai.google.dev/gemini-api/docs/quickstart
+            # The contents parameter can accept strings or multimodal content
+            # For images, we'll use PIL Image object which should be automatically handled
+            # Try with gemini-2.5-flash first (official recommended model)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt, image]
+            )
+        except Exception as api_error:
+            error_str = str(api_error)
+            logger.debug(f"API call failed: {api_error}")
+            
+            # Check if it's a quota/rate limit error
+            if '429' in error_str or 'quota' in error_str.lower() or 'RESOURCE_EXHAUSTED' in error_str:
+                logger.error("Gemini API quota/rate limit exceeded. Falling back to manual captcha entry.")
+                raise  # Re-raise to trigger fallback to manual entry
+            
+            # Check if it's a 404 (model not found) - try alternative models
+            if '404' in error_str or 'NOT_FOUND' in error_str:
+                logger.warning(f"Model {model_name} not found, trying alternative models...")
+                fallback_models = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']
+                for fallback_model in fallback_models:
+                    try:
+                        logger.info(f"Trying fallback model: {fallback_model}")
+                        response = client.models.generate_content(
+                            model=fallback_model,
+                            contents=[prompt, image]
+                        )
+                        logger.info(f"Successfully used model: {fallback_model}")
+                        break
+                    except Exception as fallback_error:
+                        logger.debug(f"Fallback model {fallback_model} failed: {fallback_error}")
+                        continue
+                else:
+                    # All fallback models failed
+                    logger.error("All models failed. Check API key and available models.")
+                    raise api_error
+            else:
+                # Other error - re-raise
+                raise
+        finally:
+            # Close image immediately to free memory
+            if image:
+                try:
+                    image.close()
+                except:
+                    pass
         
-        # Extract text (preserve case and order carefully)
+        # Extract text from response
         captcha_text = None
         try:
-            # Try to get text directly from response
+            # New API structure - response should have text attribute
             if hasattr(response, 'text') and response.text:
                 captcha_text = response.text.strip()
-            # If that fails, try to get from candidates structure
             elif hasattr(response, 'candidates') and response.candidates:
+                # Fallback to candidates structure
                 if len(response.candidates) > 0:
                     candidate = response.candidates[0]
                     if hasattr(candidate, 'content') and candidate.content:
@@ -355,14 +391,10 @@ Example: If you see "AbC123" from left to right, return exactly "AbC123" - not "
             return None
         
         # Remove any extra whitespace, newlines, but preserve character order
-        # Split by whitespace and join, but keep the original order
         captcha_text = ''.join(captcha_text.split())
         
-        # Remove any non-alphanumeric characters that might have been added
-        # But be careful - some CAPTCHAs might have special chars
-        # For now, keep alphanumeric only
-        import re
         # Keep only alphanumeric characters, preserving order
+        import re
         captcha_text = ''.join(re.findall(r'[A-Za-z0-9]', captcha_text))
         
         logger.info(f"AI extracted captcha: '{captcha_text}'")
@@ -395,6 +427,11 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
     retry_count = 0
     
     while retry_count < max_retries:
+        # Check if monitoring was stopped (for monitoring mode)
+        if is_monitoring and not user_automations[user_id].get('monitoring', False):
+            logger.info("Monitoring stopped during login attempt")
+            return (False, None, False)
+        
         retry_count += 1
         attempt_text = f" (Retry #{retry_count})" if retry_count > 1 else ""
         if attempt_num:
@@ -412,7 +449,7 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
                     await update.message.reply_text("❌ Failed to select state")
                 return (False, None, False)
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced delay
             
             if not automation.navigate_to_appointments():
                 if is_monitoring:
@@ -424,7 +461,7 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
                     await update.message.reply_text("❌ Failed to navigate to appointments")
                 return (False, None, False)
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced delay
             
             if not automation.navigate_to_dl_slot_booking():
                 if is_monitoring:
@@ -436,7 +473,7 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
                     await update.message.reply_text("❌ Failed to navigate to DL slot booking")
                 return (False, None, False)
             
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced delay
             
             # Get captcha image
             captcha_file = automation.get_captcha_image()
@@ -457,7 +494,7 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
             # Try AI solving if method is 'ai'
             if captcha_method == 'ai':
                 gemini_key = user_automations[user_id].get('gemini_api_key') or DEFAULT_GEMINI_API_KEY
-                if gemini_key and gemini_key != 'YOUR_GEMINI_API_KEY_HERE':
+                if gemini_key:
                     if is_monitoring:
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
@@ -538,14 +575,38 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
                 else:
                     user_automations[user_id]['check_mode'] = True
                 
-                # Wait for captcha input
-                await asyncio.sleep(60)  # Wait up to 60 seconds
+                # Wait for captcha input (check monitoring status frequently)
+                # Break the wait into smaller chunks to check monitoring status
+                waited = 0
+                timeout = 30  # 30 seconds total
+                check_interval = 2  # Check every 2 seconds
                 
+                while waited < timeout:
+                    # Check if monitoring was stopped
+                    if is_monitoring and not user_automations[user_id].get('monitoring', False):
+                        user_automations[user_id]['waiting_for_captcha'] = False
+                        logger.info("Monitoring stopped while waiting for captcha")
+                        return (False, None, False)
+                    
+                    # Check if captcha was received
+                    if not user_automations[user_id].get('waiting_for_captcha', False):
+                        captcha_code = user_automations[user_id].get('captcha_code')
+                        break
+                    
+                    await asyncio.sleep(check_interval)
+                    waited += check_interval
+                
+                # Check one more time after timeout
                 if not user_automations[user_id].get('waiting_for_captcha', False):
                     captcha_code = user_automations[user_id].get('captcha_code')
                 else:
                     # Timeout
                     user_automations[user_id]['waiting_for_captcha'] = False
+                    # Check if monitoring was stopped
+                    if is_monitoring and not user_automations[user_id].get('monitoring', False):
+                        logger.info("Monitoring stopped during captcha timeout")
+                        return (False, None, False)
+                    
                     if is_monitoring:
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
@@ -553,15 +614,19 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
                         )
                     else:
                         await update.message.reply_text("⏱️ Captcha timeout. Retrying...")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)  # Reduced delay
                     continue
             
-            # Clean up captcha file
+            # Clean up captcha file immediately after use
             if captcha_file and os.path.exists(captcha_file):
                 try:
                     os.remove(captcha_file)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Could not remove captcha file: {e}")
+            
+            # Periodic cleanup of old files
+            if retry_count % 3 == 0:  # Every 3 retries
+                cleanup_captcha_files()
             
             # Try login with captcha
             if captcha_code:
@@ -583,8 +648,8 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
                     continue
             else:
                 # No captcha code available, retry
-                await asyncio.sleep(2)
-                continue
+                    await asyncio.sleep(1)  # Reduced delay
+                    continue
                 
         except Exception as e:
             logger.error(f"Error in attempt_login_with_retry: {e}")
@@ -595,7 +660,7 @@ async def attempt_login_with_retry(update, context, user_id, automation, captcha
                 )
             else:
                 await update.message.reply_text(f"❌ Error{attempt_text}: {str(e)}. Retrying...")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)  # Reduced delay
             continue
     
     # Max retries reached
@@ -684,7 +749,7 @@ async def process_login_and_booking(update, context, user_id, captcha_code):
         login_result = automation.login(captcha_code)
         
         if login_result:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced delay
             availability = automation.check_slot_availability()
             
             if availability.get('available') is False:
@@ -774,8 +839,9 @@ async def start_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     
-    # Start monitoring in background
-    asyncio.create_task(monitor_loop(update, context, user_id))
+    # Start monitoring in background and store task reference
+    monitoring_task = asyncio.create_task(monitor_loop(update, context, user_id))
+    user_automations[user_id]['monitoring_task'] = monitoring_task
 
 
 async def monitor_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
@@ -792,20 +858,31 @@ async def monitor_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
     
     try:
         while user_automations[user_id].get('monitoring', False):
+            # Check monitoring status at the start of each iteration
+            if not user_automations[user_id].get('monitoring', False):
+                logger.info("Monitoring stopped, exiting loop")
+                break
+            
             # Refresh check_interval at the start of each iteration to get the latest value
             check_interval = user_automations[user_id].get('check_interval', DEFAULT_CHECK_INTERVAL)
             attempts += 1
             
-            # Send notification that check is starting
-            interval_minutes = check_interval // 60
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"🔔 *Check #{attempts} Starting*\n\n"
-                     f"Starting slot check now. Please solve the captcha when I send it.\n"
-                     f"Next check in {interval_minutes} minutes.",
-                parse_mode='Markdown'
-            )
+            # Send notification that check is starting (only every 5th attempt to reduce spam)
+            if attempts == 1 or attempts % 5 == 0:
+                interval_minutes = check_interval // 60
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"🔔 *Check #{attempts} Starting*\n\n"
+                         f"Starting slot check now. Please solve the captcha when I send it.\n"
+                         f"Next check in {interval_minutes} minutes.",
+                    parse_mode='Markdown'
+                )
             
+            # Check monitoring status before starting login attempt
+            if not user_automations[user_id].get('monitoring', False):
+                logger.info("Monitoring stopped before login attempt")
+                break
+                
             try:
                 captcha_method = user_automations[user_id].get('captcha_method', DEFAULT_CAPTCHA_METHOD)
                 
@@ -814,6 +891,11 @@ async def monitor_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                     update, context, user_id, automation, captcha_method,
                     attempt_num=attempts, is_monitoring=True
                 )
+                
+                # Check if monitoring was stopped during login attempt
+                if not user_automations[user_id].get('monitoring', False):
+                    logger.info("Monitoring stopped during login attempt")
+                    break
                 
                 if max_retries_reached:
                     # Max retries reached - wait for next interval
@@ -826,7 +908,7 @@ async def monitor_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                 
                 if success:
                     # Login successful, proceed with slot checking/booking
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)  # Reduced delay
                     availability = automation.check_slot_availability()
                     
                     if availability.get('available') is False:
@@ -884,10 +966,12 @@ async def monitor_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                     
                     # Wait before next check (only if monitoring is still active)
                     if user_automations[user_id].get('monitoring', False):
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"⏳ Waiting {check_interval // 60} minutes before next check..."
-                        )
+                        # Only send waiting message every 5th attempt
+                        if attempts % 5 == 0:
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=f"⏳ Waiting {check_interval // 60} minutes before next check..."
+                            )
                         await asyncio.sleep(check_interval)
                 else:
                     # Login failed (other error, not max retries - shouldn't normally happen)
@@ -897,10 +981,12 @@ async def monitor_loop(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
                     )
                     # Wait before next check
                     if user_automations[user_id].get('monitoring', False):
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"⏳ Waiting {check_interval // 60} minutes before next check..."
-                        )
+                        # Only send waiting message every 5th attempt
+                        if attempts % 5 == 0:
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=f"⏳ Waiting {check_interval // 60} minutes before next check..."
+                            )
                         await asyncio.sleep(check_interval)
                 
             except Exception as e:
@@ -971,7 +1057,21 @@ async def stop_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Monitoring is not running")
         return
     
+    # Set monitoring flag to False
     user_automations[user_id]['monitoring'] = False
+    
+    # Cancel the monitoring task if it exists
+    monitoring_task = user_automations[user_id].get('monitoring_task')
+    if monitoring_task and not monitoring_task.done():
+        monitoring_task.cancel()
+        try:
+            await monitoring_task
+        except asyncio.CancelledError:
+            pass
+    
+    # Clear waiting states
+    user_automations[user_id]['waiting_for_captcha'] = False
+    
     await update.message.reply_text("✅ Monitoring stopped")
 
 
@@ -1301,7 +1401,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if login_result:
                     # Login successful, proceed with booking check
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)  # Reduced delay
                     availability = automation.check_slot_availability()
                     
                     if availability.get('available') is False:
@@ -1382,23 +1482,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def schedule_checker():
-    """Background task to check and apply scheduled pause/resume"""
-    while True:
-        try:
-            check_scheduled_pause()
-            # Check every minute
-            await asyncio.sleep(60)
-        except Exception as e:
-            logger.error(f"Error in schedule checker: {e}")
-            await asyncio.sleep(60        )
-
-
 # Global variable to store schedule checker task
 schedule_checker_task = None
 
 async def schedule_checker():
-    """Background task to check and apply scheduled pause/resume"""
+    """Background task to check and apply scheduled pause/resume (optimized)"""
     global schedule_checker_task
     while True:
         try:
@@ -1416,6 +1504,22 @@ async def schedule_checker():
 def main():
     """Start the bot"""
     try:
+        # Validate required environment variables at startup
+        required_vars = {
+            "BOT_TOKEN": BOT_TOKEN,
+            "AUTHORIZED_USERS": AUTHORIZED_USERS_STR,
+            "APPLICATION_NUMBER": DEFAULT_APPLICATION_NUMBER,
+            "DOB": DEFAULT_DOB,
+            "GEMINI_API_KEY": DEFAULT_GEMINI_API_KEY
+        }
+        
+        missing_vars = [var for var, value in required_vars.items() if not value]
+        if missing_vars:
+            error_msg = f"❌ Missing required environment variables: {', '.join(missing_vars)}\n"
+            error_msg += "Please set these in your .env file."
+            print(error_msg)
+            raise ValueError(error_msg)
+        
         # Create application with proper timeout configuration
         from telegram.ext import ApplicationBuilder
         
@@ -1431,6 +1535,7 @@ def main():
             print("ℹ️ Bot will still work, but may sleep without UptimeRobot pings")
         
         print("🤖 Bot is starting...")
+        print("✅ All environment variables loaded successfully")
         
         # Check initial schedule state
         check_scheduled_pause()

@@ -9,20 +9,38 @@ import json
 import os
 from datetime import datetime
 from urllib.parse import urlencode, quote
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 class DLBookingAutomation:
     def __init__(self, application_number, dob):
         """
-        Initialize the booking automation
+        Initialize the booking automation (optimized with connection pooling)
         
         Args:
-            application_number: Your application number (e.g., "3209941425")
-            dob: Date of birth in DD-MM-YYYY format (e.g., "04-03-1974")
+            application_number: Your application number
+            dob: Date of birth in DD-MM-YYYY format
         """
         self.application_number = application_number
         self.dob = dob
         self.base_url = "https://sarathi.parivahan.gov.in"
         self.session = requests.Session()
+        
+        # Optimize connection pooling with retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        # Reduced pool size for low RAM devices (2 connections, max 3)
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=2,
+            pool_maxsize=3
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
         
         # Set headers to mimic browser
         self.session.headers.update({
@@ -109,7 +127,10 @@ class DLBookingAutomation:
             return True
         else:
             print(f"[ERROR] Failed to load DL slot booking page: {response.status_code}")
-            print(f"[INFO] Response: {response.text[:500]}")
+            # Only read first 500 chars for debugging, then release
+            response_preview = response.text[:500] if hasattr(response, 'text') else "N/A"
+            print(f"[INFO] Response: {response_preview}")
+            del response_preview
             return False
     
     def get_captcha_image(self):
@@ -184,7 +205,7 @@ class DLBookingAutomation:
         try:
             refresh_url = f"{self.base_url}/slots/dlslotbook.do"
             self.session.get(refresh_url, timeout=10)
-            time.sleep(1)  # Small delay to avoid rate limiting
+            time.sleep(0.5)  # Reduced delay
         except Exception as e:
             print(f"[WARNING] Could not refresh page: {e}")
         
@@ -222,21 +243,22 @@ class DLBookingAutomation:
             try:
                 if attempt > 0:
                     print(f"[INFO] Retry attempt {attempt + 1}/{max_retries}...")
-                    time.sleep(2 * attempt)  # Exponential backoff
+                    time.sleep(1 * attempt)  # Reduced exponential backoff
                 
                 response = self.session.post(
                     url, 
                     data=data, 
                     headers=login_headers,
                     allow_redirects=True,
-                    timeout=30  # 30 second timeout
+                    timeout=15  # Reduced timeout for faster failure detection
                 )
                 
                 if response.status_code == 200:
+                    # Process response text immediately and release memory
                     response_text = response.text
+                    response_lower = response_text.lower()
                     
                     # Check for specific error messages (more precise)
-                    response_lower = response_text.lower()
                     error_indicators = [
                         "invalid application number",
                         "invalid dob",
@@ -259,6 +281,9 @@ class DLBookingAutomation:
                         self.application_number
                     ]
                     has_success = any(indicator.lower() in response_lower for indicator in success_indicators if indicator)
+                    
+                    # Clear response text from memory after processing
+                    del response_text, response_lower
                     
                     if has_error:
                         print("[ERROR] Login failed - check credentials or captcha")
@@ -324,21 +349,26 @@ class DLBookingAutomation:
         response = self.session.get(url)
         
         if response.status_code == 200:
+            # Process response immediately and release memory
+            response_text = response.text
+            response_lower = response_text.lower()
+            
             # Check response for slot availability message
-            if "Slots are not Available" in response.text:
+            if "Slots are not Available" in response_text:
                 # Extract number of days
                 import re
-                match = re.search(r'Slots are not Available for the next (\d+) Days', response.text)
-                if match:
-                    days = match.group(1)
-                    print(f"[INFO] No slots available for the next {days} days")
-                    return {'available': False, 'days': int(days)}
-                return {'available': False}
-            elif "available" in response.text.lower() and "slot" in response.text.lower():
+                match = re.search(r'Slots are not Available for the next (\d+) Days', response_text)
+                result = {'available': False, 'days': int(match.group(1))} if match else {'available': False}
+                # Clear response from memory
+                del response_text, response_lower
+                return result
+            elif "available" in response_lower and "slot" in response_lower:
                 print("[SUCCESS] Slots appear to be available!")
+                del response_text, response_lower
                 return {'available': True}
             else:
                 print("[INFO] Slot availability unclear from response")
+                del response_text, response_lower
                 return {'available': None}
         
         return {'available': None}
@@ -382,33 +412,40 @@ class DLBookingAutomation:
             
             if response.status_code == 200:
                 # Check response for success/failure (based on captured response)
+                # Process immediately and release memory
                 response_text = response.text
+                response_lower = response_text.lower()
                 
                 if "Slots are not Available" in response_text:
                     # Extract number of days if available
                     import re
                     match = re.search(r'Slots are not Available for the next (\d+) Days', response_text)
-                    if match:
-                        days = int(match.group(1))
-                        print(f"[INFO] No slots available for the next {days} days")
-                        return {'success': False, 'message': f'No slots available for the next {days} days', 'days': days}
-                    else:
-                        print("[INFO] No slots available")
-                        return {'success': False, 'message': 'No slots available', 'days': None}
-                elif "success" in response_text.lower() or "booked" in response_text.lower() or "appointment" in response_text.lower():
+                    days = int(match.group(1)) if match else None
+                    result = {'success': False, 'message': f'No slots available for the next {days} days' if days else 'No slots available', 'days': days}
+                    # Clear response from memory
+                    del response_text, response_lower
+                    return result
+                elif "success" in response_lower or "booked" in response_lower or "appointment" in response_lower:
                     print("[SUCCESS] Slot booked successfully!")
+                    del response_text, response_lower
                     return {'success': True, 'message': 'Slot booked successfully!', 'days': None}
-                elif "error" in response_text.lower() or "invalid" in response_text.lower():
+                elif "error" in response_lower or "invalid" in response_lower:
                     print("[ERROR] Booking failed - check response")
+                    del response_text, response_lower
                     return {'success': False, 'message': 'Booking failed - error in response', 'days': None}
                 else:
                     # Response received but status unclear
                     print("[INFO] Booking response received, checking status...")
                     # The response is the booking page - check if it shows success or error
+                    result = None
                     if "DL TEST APPOINTMENT" in response_text and "Slots are not Available" not in response_text:
                         print("[SUCCESS] Booking page loaded - slot may be available!")
-                        return {'success': True, 'message': 'Booking page loaded - slot may be available', 'days': None}
-                    return {'success': None, 'message': 'Booking status unclear', 'days': None}
+                        result = {'success': True, 'message': 'Booking page loaded - slot may be available', 'days': None}
+                    else:
+                        result = {'success': None, 'message': 'Booking status unclear', 'days': None}
+                    # Clear response from memory
+                    del response_text, response_lower
+                    return result
             else:
                 print(f"[ERROR] Booking request failed: {response.status_code}")
                 return {'success': False, 'message': f'Booking request failed: {response.status_code}', 'days': None}
@@ -440,19 +477,19 @@ class DLBookingAutomation:
         if not self.select_state("JK"):
             return False
         
-        time.sleep(1)
+        time.sleep(0.5)  # Reduced delay
         
         # Step 2: Navigate to appointments
         if not self.navigate_to_appointments():
             return False
         
-        time.sleep(1)
+        time.sleep(0.5)  # Reduced delay
         
         # Step 3: Navigate to DL slot booking
         if not self.navigate_to_dl_slot_booking():
             return False
         
-        time.sleep(1)
+        time.sleep(0.5)  # Reduced delay
         
         # Step 3.5: Get captcha image if not provided
         if captcha_code is None:
@@ -469,7 +506,7 @@ class DLBookingAutomation:
         elif login_result is None:
             print("[WARNING] Login status unclear, continuing...")
         
-        time.sleep(1)
+        time.sleep(0.5)  # Reduced delay
         
         # Step 5: Check slot availability
         availability = self.check_slot_availability()
@@ -477,7 +514,7 @@ class DLBookingAutomation:
             print(f"[INFO] No slots available. Waiting...")
             return False
         
-        time.sleep(1)
+        time.sleep(0.5)  # Reduced delay
         
         # Step 6: Book slot
         booking_result = self.book_slot(iscov, covcd)
@@ -509,12 +546,12 @@ class DLBookingAutomation:
             if not self.select_state("JK"):
                 print("[ERROR] Failed to select state")
                 return
-            time.sleep(1)
+            time.sleep(0.5)  # Reduced delay
             
             if not self.navigate_to_appointments():
                 print("[ERROR] Failed to navigate to appointments")
                 return
-            time.sleep(1)
+            time.sleep(0.5)  # Reduced delay
             
             while True:
                 attempts += 1
@@ -525,7 +562,7 @@ class DLBookingAutomation:
                     print("[ERROR] Failed to navigate to DL slot booking page")
                     time.sleep(check_interval)
                     continue
-                time.sleep(1)
+                time.sleep(0.5)  # Reduced delay
                 
                 # Get captcha image first
                 captcha_file = self.get_captcha_image()
@@ -566,11 +603,25 @@ class DLBookingAutomation:
 
 def main():
     """
-    Main function - Configure your details here
+    Main function - Loads configuration from environment variables
     """
-    # Configuration
-    APPLICATION_NUMBER = "3209941425"
-    DOB = "04-03-1974"
+    # Load configuration from environment variables
+    import os
+    from dotenv import load_dotenv
+    
+    # Try to load environment variables from .env file
+    try:
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed, skip
+    
+    APPLICATION_NUMBER = os.getenv("APPLICATION_NUMBER")
+    DOB = os.getenv("DOB")
+    
+    if not APPLICATION_NUMBER:
+        raise ValueError("APPLICATION_NUMBER environment variable is required. Please set it in your .env file.")
+    if not DOB:
+        raise ValueError("DOB environment variable is required. Please set it in your .env file.")
     
     # Create automation instance
     automation = DLBookingAutomation(APPLICATION_NUMBER, DOB)
